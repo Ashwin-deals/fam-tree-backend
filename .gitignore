@@ -1,0 +1,17 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+django.sqlite3
+media/
+staticfiles/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
