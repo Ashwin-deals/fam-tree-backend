@@ -17,6 +17,7 @@ from apps.core.security import create_access_token
 from apps.core.services import (
     calculate_relationship,
     create_invite_code,
+    create_session,
     family_member_ids,
     find_household,
     find_family,
@@ -29,6 +30,7 @@ from apps.core.services import (
     require_household_manager,
     require_household_member,
     require_member,
+    save_uploaded_attachment,
     save_uploaded_image,
     serialize_family,
     serialize_grocery_item,
@@ -38,9 +40,14 @@ from apps.core.services import (
     serialize_relationship,
     serialize_reminder,
     serialize_reminder_notification,
+    serialize_session,
     serialize_user,
+    serialize_user_settings,
 )
 from .serializers import (
+    ChangeEmailSerializer,
+    ChangePasswordSerializer,
+    DeactivateAccountSerializer,
     FamilyPatchSerializer,
     FamilySerializer,
     GroceryItemPatchSerializer,
@@ -57,11 +64,20 @@ from .serializers import (
     RelationshipPatchSerializer,
     RelationshipSerializer,
     ReminderSnoozeSerializer,
+    UserSettingsSerializer,
 )
+from rest_framework import serializers
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
 
-def auth_payload(user: dict) -> dict:
-    return {"access_token": create_access_token(user), "user": serialize_user(user)}
+class RelationshipInviteSerializer(serializers.Serializer):
+    invited_name = serializers.CharField(max_length=100)
+    relationship_type = serializers.ChoiceField(choices=["parent", "spouse", "sibling", "uncle", "aunt", "grandparent", "cousin", "nephew", "niece", "grandchild"])
+
+
+def auth_payload(user: dict, request) -> dict:
+    session_id = create_session(user["_id"], request)
+    return {"access_token": create_access_token(user, session_id), "user": serialize_user(user)}
 
 
 def canonical_relationship(data: dict) -> dict:
@@ -70,7 +86,7 @@ def canonical_relationship(data: dict) -> dict:
         from rest_framework.exceptions import ValidationError
         raise ValidationError("A person cannot have a relationship with themselves.")
     # Parent direction is meaningful. Other undirected edges are stored exactly once.
-    if data["relationship_type"] in {"spouse", "sibling"} and str(first) > str(second):
+    if data["relationship_type"] in {"spouse", "sibling", "cousin"} and str(first) > str(second):
         first, second = second, first
     return {"person1_id": first, "person2_id": second, "relationship_type": data["relationship_type"]}
 
@@ -218,6 +234,12 @@ class RegisterView(APIView):
             "occupation": "",
             "bio": "",
             "token_version": 0,
+            "is_active": True,
+            "deactivated_at": None,
+            "last_active_at": None,
+            "privacy": {"activity_status_enabled": True, "show_profile_details": True},
+            "notifications": {"enabled": True, "messages": True, "household_reminders": True, "family_activity": True},
+            "appearance": {"reduce_motion": False},
             "created_at": now(),
             "updated_at": now(),
         }
@@ -225,7 +247,7 @@ class RegisterView(APIView):
             user["_id"] = get_database().users.insert_one(user).inserted_id
         except DuplicateKeyError:
             return Response({"error": {"code": "duplicate_email", "message": "An account with this email already exists.", "details": {"email": ["This email is already in use."]}}}, status=status.HTTP_409_CONFLICT)
-        return Response(auth_payload(user), status=status.HTTP_201_CREATED)
+        return Response(auth_payload(user, request), status=status.HTTP_201_CREATED)
 
 
 class LoginView(APIView):
@@ -238,13 +260,23 @@ class LoginView(APIView):
         user = get_database().users.find_one({"email": data["email"]})
         if not user or not check_password(data["password"], user.get("password_hash", "")):
             return Response({"error": {"code": "invalid_credentials", "message": "Email or password is incorrect.", "details": {}}}, status=status.HTTP_401_UNAUTHORIZED)
-        return Response(auth_payload(user))
+        if not user.get("is_active", True):
+            return Response({"error": {"code": "account_deactivated", "message": "This account has been deactivated.", "details": {}}}, status=status.HTTP_403_FORBIDDEN)
+        return Response(auth_payload(user, request))
 
 
 class LogoutView(APIView):
     def post(self, request):
-        # Token-version invalidates every active signed token for this account without a blacklist collection.
-        get_database().users.update_one({"_id": request.user.document["_id"]}, {"$inc": {"token_version": 1}, "$set": {"updated_at": now()}})
+        database = get_database()
+        if request.user.session_id:
+            # Sign out only this device; other active sessions are untouched.
+            database.sessions.update_one(
+                {"session_id": request.user.session_id, "user_id": request.user.document["_id"]},
+                {"$set": {"revoked": True}},
+            )
+        else:
+            # A legacy token with no session id can only be revoked the old blanket way.
+            database.users.update_one({"_id": request.user.document["_id"]}, {"$inc": {"token_version": 1}, "$set": {"updated_at": now()}})
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -278,15 +310,116 @@ class UserDetailView(APIView):
         target_id = object_id(user_id, "user_id")
         user = get_database().users.find_one({"_id": target_id})
         if not user:
-            from rest_framework.exceptions import NotFound
             raise NotFound("User not found.")
+        is_self = target_id == request.user.document["_id"]
         shared_family = get_database().families.find_one({
             "members.user_id": {"$all": [request.user.document["_id"], target_id]}
         })
-        if not shared_family and target_id != request.user.document["_id"]:
-            from rest_framework.exceptions import PermissionDenied
+        if not shared_family and not is_self:
             raise PermissionDenied("You may only view profiles in a shared family.")
+        privacy = user.get("privacy") or {}
+        full = is_self or privacy.get("show_profile_details", True)
+        return Response({"user": serialize_user(user, full=full)})
+
+
+class UserSettingsView(APIView):
+    def get(self, request):
+        return Response({"settings": serialize_user_settings(request.user.document)})
+
+    def patch(self, request):
+        serializer = UserSettingsSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        field_map = {
+            "activity_status_enabled": "privacy.activity_status_enabled",
+            "show_profile_details": "privacy.show_profile_details",
+            "notifications_enabled": "notifications.enabled",
+            "notify_messages": "notifications.messages",
+            "notify_household_reminders": "notifications.household_reminders",
+            "notify_family_activity": "notifications.family_activity",
+            "reduce_motion": "appearance.reduce_motion",
+        }
+        updates = {field_map[key]: value for key, value in data.items() if key in field_map}
+        if updates:
+            updates["updated_at"] = now()
+            get_database().users.update_one({"_id": request.user.document["_id"]}, {"$set": updates})
+        user = get_database().users.find_one({"_id": request.user.document["_id"]})
+        return Response({"settings": serialize_user_settings(user)})
+
+
+class ChangePasswordView(APIView):
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if not check_password(data["current_password"], request.user.document.get("password_hash", "")):
+            raise ValidationError({"current_password": "Current password is incorrect."})
+        database = get_database()
+        database.users.update_one(
+            {"_id": request.user.document["_id"]},
+            {"$set": {"password_hash": make_password(data["new_password"]), "updated_at": now()}, "$inc": {"token_version": 1}},
+        )
+        # A password change is a security event: every other device is signed out, and this
+        # one is re-issued a fresh token/session so the current user isn't logged out too.
+        database.sessions.update_many({"user_id": request.user.document["_id"]}, {"$set": {"revoked": True}})
+        user = database.users.find_one({"_id": request.user.document["_id"]})
+        return Response(auth_payload(user, request))
+
+
+class ChangeEmailView(APIView):
+    def post(self, request):
+        serializer = ChangeEmailSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if not check_password(data["current_password"], request.user.document.get("password_hash", "")):
+            raise ValidationError({"current_password": "Current password is incorrect."})
+        database = get_database()
+        try:
+            database.users.update_one({"_id": request.user.document["_id"]}, {"$set": {"email": data["new_email"], "updated_at": now()}})
+        except DuplicateKeyError:
+            raise ValidationError({"new_email": "This email is already in use."})
+        user = database.users.find_one({"_id": request.user.document["_id"]})
         return Response({"user": serialize_user(user)})
+
+
+class UserSessionsView(APIView):
+    def get(self, request):
+        sessions = list(get_database().sessions.find({"user_id": request.user.document["_id"], "revoked": False}).sort("last_seen_at", -1))
+        return Response({"sessions": [serialize_session(session, current=session["session_id"] == request.user.session_id) for session in sessions]})
+
+
+class RevokeOtherSessionsView(APIView):
+    def post(self, request):
+        get_database().sessions.update_many(
+            {"user_id": request.user.document["_id"], "session_id": {"$ne": request.user.session_id}},
+            {"$set": {"revoked": True}},
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class UserSessionDetailView(APIView):
+    def delete(self, request, session_id: str):
+        database = get_database()
+        session = database.sessions.find_one({"session_id": session_id, "user_id": request.user.document["_id"]})
+        if not session:
+            raise NotFound("Session not found.")
+        database.sessions.update_one({"_id": session["_id"]}, {"$set": {"revoked": True}})
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class DeactivateAccountView(APIView):
+    def post(self, request):
+        serializer = DeactivateAccountSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if not check_password(serializer.validated_data["password"], request.user.document.get("password_hash", "")):
+            raise ValidationError({"password": "Your password is incorrect."})
+        database = get_database()
+        database.users.update_one(
+            {"_id": request.user.document["_id"]},
+            {"$set": {"is_active": False, "deactivated_at": now(), "updated_at": now()}, "$inc": {"token_version": 1}},
+        )
+        database.sessions.update_many({"user_id": request.user.document["_id"]}, {"$set": {"revoked": True}})
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class FamiliesView(APIView):
@@ -323,15 +456,51 @@ class JoinFamilyView(APIView):
     def post(self, request):
         serializer = JoinFamilySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        family = get_database().families.find_one({"invite_code": serializer.validated_data["invite_code"]})
-        if not family:
+        code = serializer.validated_data["invite_code"]
+        
+        family = get_database().families.find_one({"invite_code": code})
+        if family:
+            if membership_for(family, request.user.document["_id"]):
+                return Response({"family": serialize_family(family, membership_for(family, request.user.document["_id"])), "already_member": True})
+            membership = {"user_id": request.user.document["_id"], "role": "member", "joined_at": now()}
+            get_database().families.update_one({"_id": family["_id"]}, {"$push": {"members": membership}, "$set": {"updated_at": now()}})
+            family["members"].append(membership)
+            return Response({"family": serialize_family(family, membership)}, status=status.HTTP_201_CREATED)
+            
+        invite = get_database().family_invites.find_one({"code": code})
+        if not invite:
             from rest_framework.exceptions import ValidationError
             raise ValidationError({"invite_code": "That invitation code is not valid."})
-        if membership_for(family, request.user.document["_id"]):
-            return Response({"family": serialize_family(family, membership_for(family, request.user.document["_id"])), "already_member": True})
-        membership = {"user_id": request.user.document["_id"], "role": "member", "joined_at": now()}
-        get_database().families.update_one({"_id": family["_id"]}, {"$push": {"members": membership}, "$set": {"updated_at": now()}})
-        family["members"].append(membership)
+            
+        family = find_family(str(invite["family_id"]))
+        user_id = request.user.document["_id"]
+        if membership_for(family, user_id):
+            return Response({"family": serialize_family(family, membership_for(family, user_id)), "already_member": True})
+            
+        pending_id = invite["pending_id"]
+        
+        get_database().families.update_one(
+            {"_id": family["_id"], "members.pending_id": pending_id},
+            {"$set": {
+                "members.$.user_id": user_id,
+                "members.$.is_pending": False,
+                "updated_at": now()
+            }}
+        )
+        
+        get_database().relationships.update_many(
+            {"person1_id": str(pending_id)},
+            {"$set": {"person1_id": str(user_id)}}
+        )
+        get_database().relationships.update_many(
+            {"person2_id": str(pending_id)},
+            {"$set": {"person2_id": str(user_id)}}
+        )
+        
+        get_database().family_invites.delete_one({"_id": invite["_id"]})
+        
+        family = find_family(str(family["_id"]))
+        membership = membership_for(family, user_id)
         return Response({"family": serialize_family(family, membership)}, status=status.HTTP_201_CREATED)
 
 
@@ -365,6 +534,9 @@ class FamilyMembersView(APIView):
         members_by_id = {user["_id"]: user for user in get_database().users.find({"_id": {"$in": list(family_member_ids(family))}})}
         members = []
         for membership in family.get("members", []):
+            # Pending (invited-but-not-yet-joined) entries have a pending_id, not a user_id.
+            if not membership.get("user_id"):
+                continue
             user = members_by_id.get(membership["user_id"])
             if user:
                 value = serialize_user(user)
@@ -404,17 +576,70 @@ class FamilyInviteView(APIView):
         get_database().families.update_one({"_id": family["_id"]}, {"$set": {"invite_code": code, "updated_at": now()}})
         return Response({"invite_code": code})
 
+class FamilyInvitesView(APIView):
+    def post(self, request, family_id: str):
+        family = find_family(family_id)
+        require_member(family, request.user.document["_id"])
+        serializer = RelationshipInviteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        pending_id = ObjectId()
+        code = create_invite_code()
+        
+        pending_member = {
+            "pending_id": pending_id,
+            "name": serializer.validated_data["invited_name"],
+            "is_pending": True,
+            "joined_at": now(),
+            "role": "member",
+            "invited_by": request.user.document["_id"]
+        }
+        
+        get_database().families.update_one({"_id": family["_id"]}, {"$push": {"members": pending_member}})
+        
+        edge = canonical_relationship({
+            "person1_id": str(request.user.document["_id"]),
+            "person2_id": str(pending_id),
+            "relationship_type": serializer.validated_data["relationship_type"]
+        })
+        edge["family_id"] = family["_id"]
+        edge["created_at"] = now()
+        get_database().relationships.insert_one(edge)
+        
+        get_database().family_invites.insert_one({
+            "family_id": family["_id"],
+            "code": code,
+            "pending_id": pending_id,
+            "created_by": request.user.document["_id"],
+            "created_at": now()
+        })
+        
+        return Response({"invite_code": code, "pending_id": str(pending_id)}, status=status.HTTP_201_CREATED)
+
 
 class FamilyTreeView(APIView):
     def get(self, request, family_id: str):
         family = find_family(family_id)
         require_member(family, request.user.document["_id"])
         member_ids = list(family_member_ids(family))
-        users = list(get_database().users.find({"_id": {"$in": member_ids}}))
+        users = {user["_id"]: serialize_user(user) for user in get_database().users.find({"_id": {"$in": member_ids}})}
+        
+        serialized_members = []
+        for member in family.get("members", []):
+            if member.get("is_pending"):
+                serialized_members.append({
+                    "id": str(member["pending_id"]),
+                    "name": member.get("name", "Pending member"),
+                    "is_pending": True,
+                    "profile_picture": None
+                })
+            elif member.get("user_id") and member["user_id"] in users:
+                serialized_members.append(users[member["user_id"]])
+                
         relationships = list(get_database().relationships.find({"family_id": family["_id"]}))
         return Response({
             "family": serialize_family(family, membership_for(family, request.user.document["_id"])),
-            "members": [serialize_user(user) for user in users],
+            "members": serialized_members,
             "relationships": [serialize_relationship(edge) for edge in relationships],
         })
 
@@ -590,10 +815,50 @@ class HouseholdMessagesView(APIView):
         require_household_member(household, request.user.document["_id"])
         serializer = HouseholdMessageSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        attachment = data.get("attachment")
+        attachment_type = data.get("attachment_type") or None
         message = {
             "household_id": household["_id"],
             "sender_id": request.user.document["_id"],
-            "text": serializer.validated_data["text"],
+            "text": data["text"],
+            "attachment_type": attachment_type,
+            "attachment_url": save_uploaded_attachment(attachment, f"chat/{attachment_type}", attachment_type) if attachment and attachment_type else None,
+            "duration_seconds": data.get("duration_seconds"),
+            "created_at": now(),
+        }
+        message["_id"] = get_database().messages.insert_one(message).inserted_id
+        return Response({"message": serialize_household_message(message, request.user.document)}, status=status.HTTP_201_CREATED)
+
+
+class FamilyMessagesView(APIView):
+    def get(self, request, family_id: str):
+        family = find_family(family_id)
+        require_member(family, request.user.document["_id"])
+        try:
+            limit = min(max(int(request.query_params.get("limit", 60)), 1), 100)
+        except ValueError:
+            limit = 60
+        messages = list(get_database().messages.find({"family_id": family["_id"]}).sort("created_at", -1).limit(limit))
+        messages.reverse()
+        users = users_by_id({message["sender_id"] for message in messages})
+        return Response({"messages": [serialize_household_message(message, users.get(message["sender_id"])) for message in messages]})
+
+    def post(self, request, family_id: str):
+        family = find_family(family_id)
+        require_member(family, request.user.document["_id"])
+        serializer = HouseholdMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        attachment = data.get("attachment")
+        attachment_type = data.get("attachment_type") or None
+        message = {
+            "family_id": family["_id"],
+            "sender_id": request.user.document["_id"],
+            "text": data["text"],
+            "attachment_type": attachment_type,
+            "attachment_url": save_uploaded_attachment(attachment, f"chat/{attachment_type}", attachment_type) if attachment and attachment_type else None,
+            "duration_seconds": data.get("duration_seconds"),
             "created_at": now(),
         }
         message["_id"] = get_database().messages.insert_one(message).inserted_id
@@ -720,6 +985,11 @@ class HouseholdDueRemindersView(APIView):
     def get(self, request, household_id: str):
         household = find_household(household_id)
         require_household_member(household, request.user.document["_id"])
+        notifications = request.user.document.get("notifications") or {}
+        if not notifications.get("enabled", True) or not notifications.get("household_reminders", True):
+            # Enforced server-side: a user who has turned reminders off never receives them,
+            # regardless of what the frontend does.
+            return Response({"reminders": []})
         timestamp = now()
         reminders = list(get_database().reminders.find({
             "household_id": household["_id"],

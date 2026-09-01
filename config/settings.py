@@ -82,7 +82,7 @@ if MONGODB_DATABASE != "family-tree":
     raise RuntimeError("MONGODB_DATABASE must be exactly 'family-tree'.")
 
 JWT_ACCESS_MINUTES = int(os.getenv("JWT_ACCESS_MINUTES", "60"))
-CORS_ALLOWED_ORIGINS = csv_env("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
+CORS_ALLOWED_ORIGINS = csv_env("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 CORS_ALLOW_CREDENTIALS = False
 
 REST_FRAMEWORK = {

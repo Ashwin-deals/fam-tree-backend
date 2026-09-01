@@ -9,12 +9,13 @@ from django.utils import timezone
 from rest_framework.exceptions import AuthenticationFailed
 
 
-def create_access_token(user: dict) -> str:
+def create_access_token(user: dict, session_id: str | None = None) -> str:
     now = timezone.now()
     payload = {
         "sub": str(user["_id"]),
         "email": user["email"],
         "tv": user.get("token_version", 0),
+        "sid": session_id,
         "iat": now,
         "exp": now + timedelta(minutes=settings.JWT_ACCESS_MINUTES),
         "iss": "family-tree-api",

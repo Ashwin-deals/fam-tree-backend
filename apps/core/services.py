@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import secrets
+import uuid
 from typing import Iterable
 
 from bson import ObjectId
@@ -11,6 +12,8 @@ from django.core.files.storage import default_storage
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
 from .database import get_database
+
+ACTIVITY_WINDOW_MINUTES = 5
 
 
 def now() -> datetime:
@@ -29,22 +32,105 @@ def identifier(document: dict) -> dict:
     return document
 
 
-def serialize_user(user: dict, include_email: bool = True) -> dict:
+def is_user_online(user: dict) -> bool:
+    """Activity status is opt-out per user and only ever derived server-side."""
+    privacy = user.get("privacy") or {}
+    if not privacy.get("activity_status_enabled", True):
+        return False
+    last_active = user.get("last_active_at")
+    if not last_active:
+        return False
+    if last_active.tzinfo is None:
+        last_active = last_active.replace(tzinfo=timezone.utc)
+    return (now() - last_active) <= timedelta(minutes=ACTIVITY_WINDOW_MINUTES)
+
+
+def serialize_user(user: dict, include_email: bool = True, full: bool = True) -> dict:
     result = {
         "id": str(user["_id"]),
         "name": user.get("name", ""),
         "profile_picture": user.get("profile_picture"),
-        "date_of_birth": user.get("date_of_birth"),
-        "gender": user.get("gender"),
-        "location": user.get("location", ""),
-        "occupation": user.get("occupation", ""),
-        "bio": user.get("bio", ""),
+        "is_online": is_user_online(user),
         "created_at": user.get("created_at"),
         "updated_at": user.get("updated_at"),
     }
+    if full:
+        result.update({
+            "date_of_birth": user.get("date_of_birth"),
+            "gender": user.get("gender"),
+            "location": user.get("location", ""),
+            "occupation": user.get("occupation", ""),
+            "bio": user.get("bio", ""),
+        })
+    else:
+        result.update({"date_of_birth": None, "gender": "", "location": "", "occupation": "", "bio": ""})
     if include_email:
-        result["email"] = user.get("email", "")
+        result["email"] = user.get("email", "") if full else ""
     return result
+
+
+def serialize_user_settings(user: dict) -> dict:
+    privacy = user.get("privacy") or {}
+    notifications = user.get("notifications") or {}
+    appearance = user.get("appearance") or {}
+    return {
+        "activity_status_enabled": privacy.get("activity_status_enabled", True),
+        "show_profile_details": privacy.get("show_profile_details", True),
+        "notifications_enabled": notifications.get("enabled", True),
+        "notify_messages": notifications.get("messages", True),
+        "notify_household_reminders": notifications.get("household_reminders", True),
+        "notify_family_activity": notifications.get("family_activity", True),
+        "reduce_motion": appearance.get("reduce_motion", False),
+    }
+
+
+def parse_device_label(user_agent: str) -> str:
+    ua = user_agent or ""
+    browser = "Browser"
+    for name in ("Edg", "OPR", "Chrome", "Firefox", "Safari"):
+        if name in ua:
+            browser = {"Edg": "Edge", "OPR": "Opera"}.get(name, name)
+            break
+    os_name = "device"
+    if "Windows" in ua:
+        os_name = "Windows"
+    elif "iPhone" in ua:
+        os_name = "iPhone"
+    elif "iPad" in ua:
+        os_name = "iPad"
+    elif "Mac OS X" in ua or "Macintosh" in ua:
+        os_name = "macOS"
+    elif "Android" in ua:
+        os_name = "Android"
+    elif "Linux" in ua:
+        os_name = "Linux"
+    return f"{browser} on {os_name}"
+
+
+def create_session(user_id: ObjectId, request) -> str:
+    session_id = uuid.uuid4().hex
+    timestamp = now()
+    get_database().sessions.insert_one({
+        "user_id": user_id,
+        "session_id": session_id,
+        "device_label": parse_device_label(request.META.get("HTTP_USER_AGENT", "")),
+        "ip_address": request.META.get("REMOTE_ADDR", ""),
+        "created_at": timestamp,
+        "last_seen_at": timestamp,
+        "revoked": False,
+    })
+    return session_id
+
+
+def serialize_session(session: dict, current: bool = False) -> dict:
+    return {
+        "id": session["session_id"],
+        "device_label": session.get("device_label", "Unknown device"),
+        "ip_address": session.get("ip_address", ""),
+        "created_at": session.get("created_at"),
+        "last_seen_at": session.get("last_seen_at"),
+        "is_current": current,
+    }
 
 
 def serialize_family(family: dict, membership: dict | None = None) -> dict:
@@ -102,10 +188,14 @@ def serialize_household_member(membership: dict, user: dict | None = None) -> di
 def serialize_household_message(message: dict, sender: dict | None = None) -> dict:
     return {
         "id": str(message["_id"]),
-        "household_id": str(message["household_id"]),
+        "household_id": str(message.get("household_id", "")),
+        "family_id": str(message.get("family_id", "")),
         "sender_id": str(message["sender_id"]),
         "sender": serialize_user(sender) if sender else None,
         "text": message.get("text", ""),
+        "attachment_type": message.get("attachment_type"),
+        "attachment_url": message.get("attachment_url"),
+        "duration_seconds": message.get("duration_seconds"),
         "created_at": message.get("created_at"),
     }
 
@@ -171,7 +261,9 @@ def find_family(family_id: str) -> dict:
 
 def membership_for(family: dict, user_id: str | ObjectId) -> dict | None:
     key = ObjectId(user_id) if isinstance(user_id, str) else user_id
-    return next((member for member in family.get("members", []) if member["user_id"] == key), None)
+    # Pending (invited-but-not-yet-joined) entries have a pending_id instead of a user_id;
+    # .get() keeps this a safe no-match rather than raising for those entries.
+    return next((member for member in family.get("members", []) if member.get("user_id") == key), None)
 
 
 def require_member(family: dict, user_id: str | ObjectId) -> dict:
@@ -237,8 +329,27 @@ def save_uploaded_image(upload, prefix: str) -> str:
     return default_storage.url(path)
 
 
+ATTACHMENT_LIMITS = {
+    "image": (5 * 1024 * 1024, {"image/jpeg", "image/png", "image/webp"}, "jpg"),
+    "voice": (15 * 1024 * 1024, {"audio/webm", "audio/mp4", "audio/mpeg", "audio/ogg", "audio/wav", "audio/x-m4a"}, "webm"),
+}
+
+
+def save_uploaded_attachment(upload, prefix: str, kind: str) -> str:
+    if kind not in ATTACHMENT_LIMITS:
+        raise ValidationError({"attachment": "Unsupported attachment type."})
+    max_size, allowed_types, default_extension = ATTACHMENT_LIMITS[kind]
+    if upload.size > max_size:
+        raise ValidationError({"attachment": f"File must be {max_size // (1024 * 1024)} MB or smaller."})
+    if upload.content_type not in allowed_types:
+        raise ValidationError({"attachment": "Unsupported file type."})
+    extension = upload.name.rsplit(".", 1)[-1].lower() if "." in upload.name else default_extension
+    path = default_storage.save(f"{prefix}/{secrets.token_urlsafe(12)}.{extension}", upload)
+    return default_storage.url(path)
+
+
 def family_member_ids(family: dict) -> set[ObjectId]:
-    return {member["user_id"] for member in family.get("members", [])}
+    return {member["user_id"] for member in family.get("members", []) if member.get("user_id")}
 
 
 def relationship_graph(relationships: Iterable[dict]) -> dict[str, list[tuple[str, str]]]:
@@ -250,6 +361,24 @@ def relationship_graph(relationships: Iterable[dict]) -> dict[str, list[tuple[st
         if kind == "parent":
             graph.setdefault(a, []).append((b, "child"))
             graph.setdefault(b, []).append((a, "parent"))
+        elif kind == "uncle":
+            graph.setdefault(a, []).append((b, "uncle / aunt"))
+            graph.setdefault(b, []).append((a, "nephew / niece"))
+        elif kind == "aunt":
+            graph.setdefault(a, []).append((b, "aunt / uncle"))
+            graph.setdefault(b, []).append((a, "niece / nephew"))
+        elif kind == "grandparent":
+            graph.setdefault(a, []).append((b, "grandparent"))
+            graph.setdefault(b, []).append((a, "grandchild"))
+        elif kind == "nephew":
+            graph.setdefault(a, []).append((b, "nephew / niece"))
+            graph.setdefault(b, []).append((a, "uncle / aunt"))
+        elif kind == "niece":
+            graph.setdefault(a, []).append((b, "niece / nephew"))
+            graph.setdefault(b, []).append((a, "aunt / uncle"))
+        elif kind == "grandchild":
+            graph.setdefault(a, []).append((b, "grandchild"))
+            graph.setdefault(b, []).append((a, "grandparent"))
         else:
             graph.setdefault(a, []).append((b, kind))
             graph.setdefault(b, []).append((a, kind))

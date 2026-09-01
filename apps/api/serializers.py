@@ -81,7 +81,7 @@ class RelationshipSerializer(serializers.Serializer):
     family_id = serializers.CharField(max_length=24)
     person1_id = serializers.CharField(max_length=24)
     person2_id = serializers.CharField(max_length=24)
-    relationship_type = serializers.ChoiceField(choices=["parent", "spouse", "sibling"])
+    relationship_type = serializers.ChoiceField(choices=["parent", "spouse", "sibling", "uncle", "aunt", "grandparent", "cousin", "nephew", "niece", "grandchild"])
 
     def validate(self, attrs):
         if attrs["person1_id"] == attrs["person2_id"]:
@@ -92,7 +92,7 @@ class RelationshipSerializer(serializers.Serializer):
 class RelationshipPatchSerializer(serializers.Serializer):
     person1_id = serializers.CharField(required=False, max_length=24)
     person2_id = serializers.CharField(required=False, max_length=24)
-    relationship_type = serializers.ChoiceField(required=False, choices=["parent", "spouse", "sibling"])
+    relationship_type = serializers.ChoiceField(required=False, choices=["parent", "spouse", "sibling", "uncle", "aunt", "grandparent", "cousin", "nephew", "niece", "grandchild"])
 
     def validate(self, attrs):
         if "person1_id" in attrs and "person2_id" in attrs and attrs["person1_id"] == attrs["person2_id"]:
@@ -120,12 +120,50 @@ class HouseholdMemberUpdateSerializer(serializers.Serializer):
 
 
 class HouseholdMessageSerializer(serializers.Serializer):
-    text = serializers.CharField(max_length=2000, trim_whitespace=True)
+    text = serializers.CharField(required=False, allow_blank=True, max_length=2000, trim_whitespace=True)
+    attachment_type = serializers.ChoiceField(required=False, allow_blank=True, choices=["image", "voice", ""])
+    attachment = serializers.FileField(required=False, allow_null=True)
+    duration_seconds = serializers.IntegerField(required=False, allow_null=True, min_value=0, max_value=600)
 
-    def validate_text(self, value):
-        if not value.strip():
+    def validate(self, attrs):
+        text = (attrs.get("text") or "").strip()
+        attrs["text"] = text
+        if not text and not attrs.get("attachment"):
             raise serializers.ValidationError("Message cannot be empty.")
-        return value.strip()
+        if attrs.get("attachment") and not attrs.get("attachment_type"):
+            raise serializers.ValidationError({"attachment_type": "Specify the attachment type."})
+        return attrs
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    current_password = serializers.CharField(write_only=True, trim_whitespace=False)
+    new_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate_new_password(self, value):
+        validate_password(value)
+        return value
+
+
+class ChangeEmailSerializer(serializers.Serializer):
+    new_email = serializers.EmailField(max_length=254)
+    current_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate_new_email(self, value):
+        return value.casefold().strip()
+
+
+class DeactivateAccountSerializer(serializers.Serializer):
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+
+class UserSettingsSerializer(serializers.Serializer):
+    activity_status_enabled = serializers.BooleanField(required=False)
+    show_profile_details = serializers.BooleanField(required=False)
+    notifications_enabled = serializers.BooleanField(required=False)
+    notify_messages = serializers.BooleanField(required=False)
+    notify_household_reminders = serializers.BooleanField(required=False)
+    notify_family_activity = serializers.BooleanField(required=False)
+    reduce_motion = serializers.BooleanField(required=False)
 
 
 class GroceryItemSerializer(serializers.Serializer):

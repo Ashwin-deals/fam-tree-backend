@@ -1,12 +1,17 @@
 from django.urls import path
 
 from .views import (
+    ChangeEmailView,
+    ChangePasswordView,
+    DeactivateAccountView,
     FamiliesView,
     FamilyDetailView,
     FamilyHouseholdsView,
     FamilyInviteView,
+    FamilyInvitesView,
     FamilyMemberDetailView,
     FamilyMembersView,
+    FamilyMessagesView,
     FamilyRelationshipLookupView,
     FamilySummaryView,
     FamilyTreeView,
@@ -25,7 +30,11 @@ from .views import (
     RegisterView,
     RelationshipDetailView,
     RelationshipsView,
+    RevokeOtherSessionsView,
     UserDetailView,
+    UserSessionDetailView,
+    UserSessionsView,
+    UserSettingsView,
 )
 
 urlpatterns = [
@@ -33,6 +42,13 @@ urlpatterns = [
     path("auth/login/", LoginView.as_view()),
     path("auth/logout/", LogoutView.as_view()),
     path("users/me/", MyProfileView.as_view()),
+    path("users/me/settings/", UserSettingsView.as_view()),
+    path("users/me/password/", ChangePasswordView.as_view()),
+    path("users/me/email/", ChangeEmailView.as_view()),
+    path("users/me/deactivate/", DeactivateAccountView.as_view()),
+    path("users/me/sessions/", UserSessionsView.as_view()),
+    path("users/me/sessions/revoke-others/", RevokeOtherSessionsView.as_view()),
+    path("users/me/sessions/<str:session_id>/", UserSessionDetailView.as_view()),
     path("users/<str:user_id>/", UserDetailView.as_view()),
     path("families/", FamiliesView.as_view()),
     path("families/join/", JoinFamilyView.as_view()),
@@ -40,6 +56,8 @@ urlpatterns = [
     path("families/<str:family_id>/members/", FamilyMembersView.as_view()),
     path("families/<str:family_id>/members/<str:user_id>/", FamilyMemberDetailView.as_view()),
     path("families/<str:family_id>/invite/", FamilyInviteView.as_view()),
+    path("families/<str:family_id>/invites/", FamilyInvitesView.as_view()),
+    path("families/<str:family_id>/messages/", FamilyMessagesView.as_view()),
     path("families/<str:family_id>/tree/", FamilyTreeView.as_view()),
     path("families/<str:family_id>/relationship/", FamilyRelationshipLookupView.as_view()),
     path("families/<str:family_id>/summary/", FamilySummaryView.as_view()),

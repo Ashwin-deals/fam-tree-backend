@@ -47,6 +47,9 @@ def get_database() -> Database:
                 )
                 database.household_members.create_index([("user_id", ASCENDING)], name="household_member_user")
                 database.messages.create_index([("household_id", ASCENDING), ("created_at", ASCENDING)], name="message_timeline")
+                database.messages.create_index([("family_id", ASCENDING), ("created_at", ASCENDING)], name="family_message_timeline")
+                database.sessions.create_index([("user_id", ASCENDING)], name="session_by_user")
+                database.sessions.create_index([("session_id", ASCENDING)], unique=True, name="unique_session_id")
                 database.grocery_items.create_index([("household_id", ASCENDING), ("status", ASCENDING)], name="grocery_household_status")
                 database.grocery_items.create_index([("assigned_to", ASCENDING), ("status", ASCENDING)], name="grocery_assignment_status")
                 database.reminders.create_index(

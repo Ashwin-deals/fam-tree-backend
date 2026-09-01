@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 
 from bson import ObjectId
 from rest_framework.authentication import BaseAuthentication
@@ -8,12 +9,17 @@ from rest_framework.exceptions import AuthenticationFailed
 
 from .database import get_database
 from .security import decode_access_token
+from .services import now
+
+# Sessions/last-active are only touched when this stale, to avoid a write on every request.
+_ACTIVITY_TOUCH_INTERVAL = timedelta(seconds=60)
 
 
 @dataclass
 class MongoUser:
     """Small request-user adapter; application users remain in MongoDB."""
     document: dict
+    session_id: str | None = None
 
     @property
     def id(self) -> str:
@@ -43,7 +49,23 @@ class MongoJWTAuthentication(BaseAuthentication):
             user_id = ObjectId(claims["sub"])
         except (KeyError, TypeError, ValueError) as error:
             raise AuthenticationFailed("Invalid authentication token.") from error
-        user = get_database().users.find_one({"_id": user_id}, {"password_hash": 0})
+        database = get_database()
+        user = database.users.find_one({"_id": user_id}, {"password_hash": 0})
         if not user or user.get("token_version", 0) != claims.get("tv"):
             raise AuthenticationFailed("Your session is no longer valid. Please sign in again.")
-        return MongoUser(user), parts[1]
+        if not user.get("is_active", True):
+            raise AuthenticationFailed("This account has been deactivated.")
+        # Tokens issued before session tracking existed have no "sid" claim; let them keep
+        # working (no forced logout on deploy) but skip per-device tracking for them.
+        session_id = claims.get("sid")
+        session = None
+        if session_id:
+            session = database.sessions.find_one({"session_id": session_id, "user_id": user_id})
+            if not session or session.get("revoked"):
+                raise AuthenticationFailed("This session has been signed out. Please sign in again.")
+        timestamp = now()
+        last_seen = session.get("last_seen_at") if session else None
+        if session and (not last_seen or timestamp - last_seen > _ACTIVITY_TOUCH_INTERVAL):
+            database.sessions.update_one({"_id": session["_id"]}, {"$set": {"last_seen_at": timestamp}})
+            database.users.update_one({"_id": user_id}, {"$set": {"last_active_at": timestamp}})
+        return MongoUser(user, session_id), parts[1]
