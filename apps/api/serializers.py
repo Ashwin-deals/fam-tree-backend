@@ -138,10 +138,35 @@ class HouseholdMessageSerializer(serializers.Serializer):
 class ChangePasswordSerializer(serializers.Serializer):
     current_password = serializers.CharField(write_only=True, trim_whitespace=False)
     new_password = serializers.CharField(write_only=True, trim_whitespace=False)
+    otp = serializers.CharField(required=False, allow_blank=True, max_length=6, trim_whitespace=True)
 
     def validate_new_password(self, value):
         validate_password(value)
         return value
+
+
+class RequestPasswordOtpSerializer(serializers.Serializer):
+    current_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+
+class VerifyOtpSerializer(serializers.Serializer):
+    email = serializers.EmailField(max_length=254)
+    otp = serializers.CharField(max_length=6, min_length=6, trim_whitespace=True)
+
+    def validate_email(self, value):
+        return value.casefold().strip()
+
+    def validate_otp(self, value):
+        if not value.isdigit():
+            raise serializers.ValidationError("Enter the 6-digit code.")
+        return value
+
+
+class ResendOtpSerializer(serializers.Serializer):
+    email = serializers.EmailField(max_length=254)
+
+    def validate_email(self, value):
+        return value.casefold().strip()
 
 
 class ChangeEmailSerializer(serializers.Serializer):
@@ -201,3 +226,37 @@ class GroceryStatusSerializer(serializers.Serializer):
 
 class ReminderSnoozeSerializer(serializers.Serializer):
     minutes = serializers.IntegerField(required=False, min_value=5, max_value=10080, default=60)
+
+
+class MemorySerializer(serializers.Serializer):
+    media = serializers.FileField()
+    media_type = serializers.ChoiceField(choices=["photo", "video"])
+    caption = serializers.CharField(required=False, allow_blank=True, max_length=1000, trim_whitespace=True)
+    memory_date = serializers.DateField()
+    tagged_user_ids = serializers.ListField(child=serializers.CharField(max_length=24), required=False, allow_empty=True)
+    visibility = serializers.ChoiceField(choices=["family", "household", "selected", "private"])
+    household_id = serializers.CharField(required=False, allow_blank=True, max_length=24)
+    selected_user_ids = serializers.ListField(child=serializers.CharField(max_length=24), required=False, allow_empty=True)
+
+    def validate(self, attrs):
+        if attrs["visibility"] == "household" and not attrs.get("household_id"):
+            raise serializers.ValidationError({"household_id": "Choose which household can see this memory."})
+        if attrs["visibility"] == "selected" and not attrs.get("selected_user_ids"):
+            raise serializers.ValidationError({"selected_user_ids": "Choose at least one family member."})
+        return attrs
+
+
+class MemoryPatchSerializer(serializers.Serializer):
+    caption = serializers.CharField(required=False, allow_blank=True, max_length=1000, trim_whitespace=True)
+    memory_date = serializers.DateField(required=False)
+    tagged_user_ids = serializers.ListField(child=serializers.CharField(max_length=24), required=False, allow_empty=True)
+    visibility = serializers.ChoiceField(required=False, choices=["family", "household", "selected", "private"])
+    household_id = serializers.CharField(required=False, allow_blank=True, max_length=24)
+    selected_user_ids = serializers.ListField(child=serializers.CharField(max_length=24), required=False, allow_empty=True)
+
+    def validate(self, attrs):
+        if attrs.get("visibility") == "household" and not attrs.get("household_id"):
+            raise serializers.ValidationError({"household_id": "Choose which household can see this memory."})
+        if attrs.get("visibility") == "selected" and not attrs.get("selected_user_ids"):
+            raise serializers.ValidationError({"selected_user_ids": "Choose at least one family member."})
+        return attrs

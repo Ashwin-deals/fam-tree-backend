@@ -6,7 +6,7 @@ from threading import Lock
 
 import certifi
 from django.conf import settings
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.database import Database
 
 _index_lock = Lock()
@@ -50,6 +50,10 @@ def get_database() -> Database:
                 database.messages.create_index([("family_id", ASCENDING), ("created_at", ASCENDING)], name="family_message_timeline")
                 database.sessions.create_index([("user_id", ASCENDING)], name="session_by_user")
                 database.sessions.create_index([("session_id", ASCENDING)], unique=True, name="unique_session_id")
+                database.otps.create_index([("user_id", ASCENDING), ("purpose", ASCENDING), ("created_at", ASCENDING)], name="otp_lookup")
+                # TTL index: MongoDB automatically deletes an OTP document once its expires_at
+                # time has passed — no separate cleanup job needed.
+                database.otps.create_index([("expires_at", ASCENDING)], expireAfterSeconds=0, name="otp_ttl")
                 database.grocery_items.create_index([("household_id", ASCENDING), ("status", ASCENDING)], name="grocery_household_status")
                 database.grocery_items.create_index([("assigned_to", ASCENDING), ("status", ASCENDING)], name="grocery_assignment_status")
                 database.reminders.create_index(
@@ -57,5 +61,10 @@ def get_database() -> Database:
                     name="reminder_due_lookup",
                 )
                 database.reminders.create_index([("grocery_item_id", ASCENDING)], unique=True, name="unique_grocery_reminder")
+                database.memories.create_index([("family_id", ASCENDING), ("_id", DESCENDING)], name="memory_family_timeline")
+                database.memories.create_index([("owner_id", ASCENDING)], name="memory_owner")
+                database.memories.create_index([("household_id", ASCENDING)], sparse=True, name="memory_household")
+                database.memories.create_index([("selected_user_ids", ASCENDING)], sparse=True, name="memory_selected_viewers")
+                database.memories.create_index([("tagged_user_ids", ASCENDING)], sparse=True, name="memory_tagged_members")
                 _indexes_created = True
     return database

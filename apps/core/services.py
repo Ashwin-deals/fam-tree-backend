@@ -8,6 +8,7 @@ import uuid
 from typing import Iterable
 
 from bson import ObjectId
+from django.contrib.auth.hashers import check_password
 from django.core.files.storage import default_storage
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
@@ -18,6 +19,18 @@ ACTIVITY_WINDOW_MINUTES = 5
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def verify_current_password(user_id: ObjectId, password: str) -> bool:
+    """Check a submitted password against the account's stored hash.
+
+    MongoJWTAuthentication deliberately excludes password_hash when it loads
+    request.user.document (see apps/core/authentication.py), so any "confirm
+    your current password" check must fetch the hash fresh here rather than
+    reading it off the already-authenticated user object.
+    """
+    user = get_database().users.find_one({"_id": user_id}, {"password_hash": 1})
+    return bool(user) and check_password(password, user.get("password_hash", ""))
 
 
 def object_id(value: str, field: str = "id") -> ObjectId:
@@ -350,6 +363,138 @@ def save_uploaded_attachment(upload, prefix: str, kind: str) -> str:
 
 def family_member_ids(family: dict) -> set[ObjectId]:
     return {member["user_id"] for member in family.get("members", []) if member.get("user_id")}
+
+
+MEMORY_MEDIA_LIMITS = {
+    "photo": (20 * 1024 * 1024, {"image/jpeg", "image/png", "image/webp"}),
+    "video": (200 * 1024 * 1024, {"video/mp4", "video/quicktime", "video/webm"}),
+}
+MEMORY_THUMBNAIL_MAX_DIMENSION = 640
+
+
+def _build_memory_thumbnail(upload, storage) -> "StoredFile":
+    from io import BytesIO
+
+    from PIL import Image, ImageOps
+
+    upload.seek(0)
+    image = ImageOps.exif_transpose(Image.open(upload))
+    image.thumbnail((MEMORY_THUMBNAIL_MAX_DIMENSION, MEMORY_THUMBNAIL_MAX_DIMENSION))
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=82)
+    return storage.save_bytes(buffer.getvalue(), filename="thumb.jpg", content_type="image/jpeg", folder="memories/thumbnails", kind="thumbnail")
+
+
+def save_memory_media(upload, media_type: str) -> dict:
+    """Validate and store a Family Moments upload (photo or video), plus a thumbnail for photos.
+
+    Storage-agnostic: delegates the actual bytes to apps.core.media_storage, which is the
+    only place that knows this is GridFS today.
+    """
+    from .media_storage import get_media_storage
+
+    if media_type not in MEMORY_MEDIA_LIMITS:
+        raise ValidationError({"media_type": "Unsupported memory type."})
+    max_size, allowed_types = MEMORY_MEDIA_LIMITS[media_type]
+    if upload.size > max_size:
+        raise ValidationError({"media": f"File must be {max_size // (1024 * 1024)} MB or smaller."})
+    if upload.content_type not in allowed_types:
+        raise ValidationError({"media": "Unsupported file type."})
+    storage = get_media_storage()
+    original = storage.save(upload, folder=f"memories/{media_type}", kind="original")
+    thumbnail = _build_memory_thumbnail(upload, storage) if media_type == "photo" else None
+    return {"media": original.as_dict(), "thumbnail": thumbnail.as_dict() if thumbnail else None}
+
+
+def delete_memory_media(storage_dict: dict) -> None:
+    from .media_storage import get_media_storage
+
+    backend = get_media_storage()
+    backend.delete(storage_dict["media"]["reference"])
+    if storage_dict.get("thumbnail"):
+        backend.delete(storage_dict["thumbnail"]["reference"])
+
+
+def open_memory_media(reference: str):
+    from .media_storage import get_media_storage
+
+    return get_media_storage().open(reference)
+
+
+def household_ids_for_user_in_family(family_id: ObjectId, user_id: ObjectId) -> set[ObjectId]:
+    # household_members carries no family_id of its own, so this is a two-step join
+    # against households — the same shape FamilyHouseholdsView already uses.
+    household_ids = {member["household_id"] for member in get_database().household_members.find({"user_id": user_id}, {"household_id": 1})}
+    if not household_ids:
+        return set()
+    return {household["_id"] for household in get_database().households.find({"_id": {"$in": list(household_ids)}, "family_id": family_id}, {"_id": 1})}
+
+
+def memory_visibility_query(family_id: ObjectId, user_id: ObjectId) -> dict:
+    """Mongo query for every memory in a family visible to this viewer.
+
+    Kept in sync with can_view_memory() below, which expresses the identical rule for a
+    single already-fetched document (used by the detail view and the media stream, where
+    a second Mongo query isn't worth it).
+    """
+    household_ids = list(household_ids_for_user_in_family(family_id, user_id))
+    return {
+        "family_id": family_id,
+        "$or": [
+            {"owner_id": user_id},
+            {"visibility": "family"},
+            {"visibility": "household", "household_id": {"$in": household_ids}},
+            {"visibility": "selected", "selected_user_ids": user_id},
+        ],
+    }
+
+
+def can_view_memory(memory: dict, user_id: ObjectId, household_ids: set[ObjectId]) -> bool:
+    if memory["owner_id"] == user_id:
+        return True
+    visibility = memory.get("visibility")
+    if visibility == "family":
+        return True
+    if visibility == "household":
+        return memory.get("household_id") in household_ids
+    if visibility == "selected":
+        return user_id in memory.get("selected_user_ids", [])
+    return False
+
+
+def serialize_memory(memory: dict, users_by_id: dict[ObjectId, dict]) -> dict:
+    owner = users_by_id.get(memory["owner_id"])
+    tagged = [serialize_user(users_by_id[user_id]) for user_id in memory.get("tagged_user_ids", []) if user_id in users_by_id]
+    storage = memory.get("storage", {})
+    media, thumbnail = storage.get("media"), storage.get("thumbnail")
+    memory_id = str(memory["_id"])
+    return {
+        "id": memory_id,
+        "family_id": str(memory["family_id"]),
+        "owner_id": str(memory["owner_id"]),
+        "owner": serialize_user(owner) if owner else None,
+        "media_type": memory["media_type"],
+        "media_url": f"/api/memories/media/{memory_id}/{media['reference']}/" if media else None,
+        "thumbnail_url": f"/api/memories/media/{memory_id}/{thumbnail['reference']}/" if thumbnail else None,
+        "content_type": media.get("content_type") if media else None,
+        "size_bytes": media.get("size_bytes") if media else None,
+        "caption": memory.get("caption", ""),
+        "memory_date": memory.get("memory_date"),
+        "tagged_user_ids": [str(user_id) for user_id in memory.get("tagged_user_ids", [])],
+        "tagged_users": tagged,
+        "visibility": memory["visibility"],
+        "household_id": str(memory["household_id"]) if memory.get("household_id") else None,
+        "selected_user_ids": [str(user_id) for user_id in memory.get("selected_user_ids", [])],
+        "created_at": memory.get("created_at"),
+        "updated_at": memory.get("updated_at"),
+    }
+
+
+def find_memory(memory_id: str, family_id: ObjectId) -> dict:
+    memory = get_database().memories.find_one({"_id": object_id(memory_id, "memory_id"), "family_id": family_id})
+    if not memory:
+        raise NotFound("Memory not found.")
+    return memory
 
 
 def relationship_graph(relationships: Iterable[dict]) -> dict[str, list[tuple[str, str]]]:

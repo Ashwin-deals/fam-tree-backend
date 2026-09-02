@@ -13,23 +13,30 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.core.database import get_database
+from apps.core.otp import is_test_account, request_otp, request_otp_lenient, verify_otp_code
 from apps.core.security import create_access_token
 from apps.core.services import (
     calculate_relationship,
+    can_view_memory,
     create_invite_code,
     create_session,
+    delete_memory_media,
     family_member_ids,
     find_household,
     find_family,
+    find_memory,
+    household_ids_for_user_in_family,
     household_member_ids,
     household_membership_for,
     membership_for,
+    memory_visibility_query,
     now,
     object_id,
     require_admin,
     require_household_manager,
     require_household_member,
     require_member,
+    save_memory_media,
     save_uploaded_attachment,
     save_uploaded_image,
     serialize_family,
@@ -37,12 +44,14 @@ from apps.core.services import (
     serialize_household,
     serialize_household_member,
     serialize_household_message,
+    serialize_memory,
     serialize_relationship,
     serialize_reminder,
     serialize_reminder_notification,
     serialize_session,
     serialize_user,
     serialize_user_settings,
+    verify_current_password,
 )
 from .serializers import (
     ChangeEmailSerializer,
@@ -58,13 +67,18 @@ from .serializers import (
     HouseholdSerializer,
     JoinFamilySerializer,
     LoginSerializer,
+    MemoryPatchSerializer,
+    MemorySerializer,
     ProfileSerializer,
     RegisterSerializer,
     RelationshipLookupSerializer,
     RelationshipPatchSerializer,
     RelationshipSerializer,
     ReminderSnoozeSerializer,
+    RequestPasswordOtpSerializer,
+    ResendOtpSerializer,
     UserSettingsSerializer,
+    VerifyOtpSerializer,
 )
 from rest_framework import serializers
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -120,6 +134,12 @@ def require_users_in_family(family: dict, user_ids: set[ObjectId]) -> None:
     if outside:
         from rest_framework.exceptions import ValidationError
         raise ValidationError({"member_ids": "Every household member must belong to this family."})
+
+
+def require_family_member_ids(family: dict, user_ids: set[ObjectId], field: str) -> None:
+    outside = user_ids - family_member_ids(family)
+    if outside:
+        raise ValidationError({field: "Every person chosen here must be a member of this family."})
 
 
 def require_user_in_household(household: dict, user_id: ObjectId | None, field: str = "assigned_to") -> None:
@@ -223,6 +243,9 @@ class RegisterView(APIView):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        # @test.com is a narrow, explicit development/testing exception (see
+        # apps.core.otp.is_test_account) — every other address must verify by OTP.
+        verified = is_test_account(data["email"])
         user = {
             "name": data["name"],
             "email": data["email"],
@@ -235,6 +258,7 @@ class RegisterView(APIView):
             "bio": "",
             "token_version": 0,
             "is_active": True,
+            "email_verified": verified,
             "deactivated_at": None,
             "last_active_at": None,
             "privacy": {"activity_status_enabled": True, "show_profile_details": True},
@@ -247,7 +271,13 @@ class RegisterView(APIView):
             user["_id"] = get_database().users.insert_one(user).inserted_id
         except DuplicateKeyError:
             return Response({"error": {"code": "duplicate_email", "message": "An account with this email already exists.", "details": {"email": ["This email is already in use."]}}}, status=status.HTTP_409_CONFLICT)
-        return Response(auth_payload(user, request), status=status.HTTP_201_CREATED)
+        if verified:
+            return Response(auth_payload(user, request), status=status.HTTP_201_CREATED)
+        # A delivery failure here shouldn't strand the account in a state the user can
+        # only recover from by retrying registration into a "duplicate email" error —
+        # they land on the verify screen either way and can hit Resend once SMTP is up.
+        otp_info = request_otp_lenient(user, "registration")
+        return Response({"pending_verification": True, "email": user["email"], **otp_info}, status=status.HTTP_201_CREATED)
 
 
 class LoginView(APIView):
@@ -262,7 +292,57 @@ class LoginView(APIView):
             return Response({"error": {"code": "invalid_credentials", "message": "Email or password is incorrect.", "details": {}}}, status=status.HTTP_401_UNAUTHORIZED)
         if not user.get("is_active", True):
             return Response({"error": {"code": "account_deactivated", "message": "This account has been deactivated.", "details": {}}}, status=status.HTTP_403_FORBIDDEN)
+        # Accounts created before this feature existed have no email_verified field at
+        # all; default True so nobody already using the app gets locked out retroactively.
+        if not user.get("email_verified", True) and not is_test_account(user["email"]):
+            otp_info = request_otp_lenient(user, "registration")
+            return Response(
+                {
+                    "error": {"code": "email_not_verified", "message": "Please verify your email to continue.", "details": {}},
+                    "pending_verification": True,
+                    "email": user["email"],
+                    **otp_info,
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         return Response(auth_payload(user, request))
+
+
+class VerifyOtpView(APIView):
+    """Completes registration: verifies the emailed code and activates the account."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = VerifyOtpSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        user = get_database().users.find_one({"email": data["email"]})
+        if not user:
+            # Don't reveal whether the address has an account — same message as a wrong code.
+            raise ValidationError({"otp": "Incorrect code. Please try again."})
+        ok, error = verify_otp_code(user["_id"], "registration", data["otp"])
+        if not ok:
+            raise ValidationError({"otp": error})
+        get_database().users.update_one({"_id": user["_id"]}, {"$set": {"email_verified": True, "updated_at": now()}})
+        user["email_verified"] = True
+        return Response(auth_payload(user, request))
+
+
+class ResendOtpView(APIView):
+    """Resends the registration OTP (rate-limited — see apps.core.otp.request_otp)."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = ResendOtpSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"]
+        user = get_database().users.find_one({"email": email})
+        if not user:
+            raise ValidationError({"email": "We couldn't find that account."})
+        if user.get("email_verified", True):
+            raise ValidationError({"email": "This account is already verified."})
+        otp_info = request_otp(user, "registration")
+        return Response({"email": email, **otp_info})
 
 
 class LogoutView(APIView):
@@ -347,13 +427,39 @@ class UserSettingsView(APIView):
         return Response({"settings": serialize_user_settings(user)})
 
 
+class RequestPasswordOtpView(APIView):
+    """Step 1 of a password change: confirm the current password, then send an OTP.
+
+    @test.com accounts skip the OTP round-trip (otp_required: false) — the frontend
+    then submits the new password directly with no otp field.
+    """
+    def post(self, request):
+        serializer = RequestPasswordOtpSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if not verify_current_password(request.user.document["_id"], serializer.validated_data["current_password"]):
+            raise ValidationError({"current_password": "Current password is incorrect."})
+        if is_test_account(request.user.document["email"]):
+            return Response({"otp_required": False})
+        otp_info = request_otp(request.user.document, "password_change")
+        return Response({"otp_required": True, **otp_info})
+
+
 class ChangePasswordView(APIView):
     def post(self, request):
         serializer = ChangePasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        if not check_password(data["current_password"], request.user.document.get("password_hash", "")):
+        if not verify_current_password(request.user.document["_id"], data["current_password"]):
             raise ValidationError({"current_password": "Current password is incorrect."})
+        # Never trust a client-supplied flag for this — the exemption is decided fresh,
+        # server-side, from the account's own email every time.
+        if not is_test_account(request.user.document["email"]):
+            otp = data.get("otp")
+            if not otp:
+                raise ValidationError({"otp": "Enter the verification code sent to your email."})
+            ok, error = verify_otp_code(request.user.document["_id"], "password_change", otp)
+            if not ok:
+                raise ValidationError({"otp": error})
         database = get_database()
         database.users.update_one(
             {"_id": request.user.document["_id"]},
@@ -371,7 +477,7 @@ class ChangeEmailView(APIView):
         serializer = ChangeEmailSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        if not check_password(data["current_password"], request.user.document.get("password_hash", "")):
+        if not verify_current_password(request.user.document["_id"], data["current_password"]):
             raise ValidationError({"current_password": "Current password is incorrect."})
         database = get_database()
         try:
@@ -411,7 +517,7 @@ class DeactivateAccountView(APIView):
     def post(self, request):
         serializer = DeactivateAccountSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        if not check_password(serializer.validated_data["password"], request.user.document.get("password_hash", "")):
+        if not verify_current_password(request.user.document["_id"], serializer.validated_data["password"]):
             raise ValidationError({"password": "Your password is incorrect."})
         database = get_database()
         database.users.update_one(
@@ -863,6 +969,136 @@ class FamilyMessagesView(APIView):
         }
         message["_id"] = get_database().messages.insert_one(message).inserted_id
         return Response({"message": serialize_household_message(message, request.user.document)}, status=status.HTTP_201_CREATED)
+
+
+class FamilyMomentsView(APIView):
+    """Family Moments: private photo/video memories, scoped to one family at a time."""
+
+    def get(self, request, family_id: str):
+        family = find_family(family_id)
+        user_id = request.user.document["_id"]
+        require_member(family, user_id)
+        try:
+            limit = min(max(int(request.query_params.get("limit", 24)), 1), 60)
+        except ValueError:
+            limit = 24
+        query = memory_visibility_query(family["_id"], user_id)
+        before = request.query_params.get("before")
+        if before:
+            query["_id"] = {"$lt": object_id(before, "before")}
+        docs = list(get_database().memories.find(query).sort("_id", -1).limit(limit + 1))
+        has_more = len(docs) > limit
+        docs = docs[:limit]
+        people = {doc["owner_id"] for doc in docs} | {user_id for doc in docs for user_id in doc.get("tagged_user_ids", [])}
+        users = users_by_id(people)
+        return Response({"memories": [serialize_memory(doc, users) for doc in docs], "has_more": has_more})
+
+    def post(self, request, family_id: str):
+        family = find_family(family_id)
+        user_id = request.user.document["_id"]
+        require_member(family, user_id)
+        serializer = MemorySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        tagged_ids = unique_object_ids(data.get("tagged_user_ids", []), "tagged_user_ids")
+        require_family_member_ids(family, set(tagged_ids), "tagged_user_ids")
+        household_id: ObjectId | None = None
+        selected_ids: list[ObjectId] = []
+        if data["visibility"] == "household":
+            household_id = object_id(data["household_id"], "household_id")
+            household = find_household(str(household_id))
+            if household["family_id"] != family["_id"]:
+                raise ValidationError({"household_id": "Choose a household in this family."})
+            require_household_member(household, user_id)
+        elif data["visibility"] == "selected":
+            selected_ids = unique_object_ids(data.get("selected_user_ids", []), "selected_user_ids")
+            require_family_member_ids(family, set(selected_ids), "selected_user_ids")
+        storage = save_memory_media(data["media"], data["media_type"])
+        timestamp = now()
+        memory = {
+            "family_id": family["_id"],
+            "owner_id": user_id,
+            "media_type": data["media_type"],
+            "caption": data.get("caption", ""),
+            "memory_date": data["memory_date"].isoformat(),
+            "tagged_user_ids": tagged_ids,
+            "visibility": data["visibility"],
+            "household_id": household_id,
+            "selected_user_ids": selected_ids,
+            "storage": storage,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+        memory["_id"] = get_database().memories.insert_one(memory).inserted_id
+        return Response({"memory": serialize_memory(memory, users_by_id({user_id} | set(tagged_ids)))}, status=status.HTTP_201_CREATED)
+
+
+class MemoryDetailView(APIView):
+    def get(self, request, family_id: str, memory_id: str):
+        family = find_family(family_id)
+        user_id = request.user.document["_id"]
+        require_member(family, user_id)
+        memory = find_memory(memory_id, family["_id"])
+        household_ids = household_ids_for_user_in_family(family["_id"], user_id)
+        if not can_view_memory(memory, user_id, household_ids):
+            raise NotFound("Memory not found.")
+        people = {memory["owner_id"]} | set(memory.get("tagged_user_ids", []))
+        return Response({"memory": serialize_memory(memory, users_by_id(people))})
+
+    def patch(self, request, family_id: str, memory_id: str):
+        family = find_family(family_id)
+        user_id = request.user.document["_id"]
+        require_member(family, user_id)
+        memory = find_memory(memory_id, family["_id"])
+        if memory["owner_id"] != user_id:
+            raise PermissionDenied("Only the person who added this memory can edit it.")
+        serializer = MemoryPatchSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        updates: dict = {}
+        if "caption" in data:
+            updates["caption"] = data["caption"]
+        if "memory_date" in data:
+            updates["memory_date"] = data["memory_date"].isoformat()
+        if "tagged_user_ids" in data:
+            tagged_ids = unique_object_ids(data["tagged_user_ids"], "tagged_user_ids")
+            require_family_member_ids(family, set(tagged_ids), "tagged_user_ids")
+            updates["tagged_user_ids"] = tagged_ids
+        if "visibility" in data or "household_id" in data or "selected_user_ids" in data:
+            visibility = data.get("visibility", memory["visibility"])
+            household_id, selected_ids = None, []
+            if visibility == "household":
+                raw_household = data.get("household_id") or (str(memory["household_id"]) if memory.get("household_id") else None)
+                if not raw_household:
+                    raise ValidationError({"household_id": "Choose which household can see this memory."})
+                household_id = object_id(raw_household, "household_id")
+                household = find_household(str(household_id))
+                if household["family_id"] != family["_id"]:
+                    raise ValidationError({"household_id": "Choose a household in this family."})
+                require_household_member(household, user_id)
+            elif visibility == "selected":
+                selected_ids = unique_object_ids(data["selected_user_ids"], "selected_user_ids") if "selected_user_ids" in data else memory.get("selected_user_ids", [])
+                if not selected_ids:
+                    raise ValidationError({"selected_user_ids": "Choose at least one family member."})
+                require_family_member_ids(family, set(selected_ids), "selected_user_ids")
+            updates.update({"visibility": visibility, "household_id": household_id, "selected_user_ids": selected_ids})
+        if updates:
+            updates["updated_at"] = now()
+            get_database().memories.update_one({"_id": memory["_id"]}, {"$set": updates})
+            memory.update(updates)
+        people = {memory["owner_id"]} | set(memory.get("tagged_user_ids", []))
+        return Response({"memory": serialize_memory(memory, users_by_id(people))})
+
+    def delete(self, request, family_id: str, memory_id: str):
+        family = find_family(family_id)
+        user_id = request.user.document["_id"]
+        require_member(family, user_id)
+        memory = find_memory(memory_id, family["_id"])
+        if memory["owner_id"] != user_id:
+            raise PermissionDenied("Only the person who added this memory can delete it.")
+        delete_memory_media(memory["storage"])
+        get_database().memories.delete_one({"_id": memory["_id"]})
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class HouseholdGroceriesView(APIView):

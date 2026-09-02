@@ -1,5 +1,6 @@
 from django.urls import path
 
+from .media_views import stream_memory_media
 from .views import (
     ChangeEmailView,
     ChangePasswordView,
@@ -12,6 +13,7 @@ from .views import (
     FamilyMemberDetailView,
     FamilyMembersView,
     FamilyMessagesView,
+    FamilyMomentsView,
     FamilyRelationshipLookupView,
     FamilySummaryView,
     FamilyTreeView,
@@ -26,23 +28,30 @@ from .views import (
     JoinFamilyView,
     LoginView,
     LogoutView,
+    MemoryDetailView,
     MyProfileView,
     RegisterView,
     RelationshipDetailView,
     RelationshipsView,
+    RequestPasswordOtpView,
+    ResendOtpView,
     RevokeOtherSessionsView,
     UserDetailView,
     UserSessionDetailView,
     UserSessionsView,
     UserSettingsView,
+    VerifyOtpView,
 )
 
 urlpatterns = [
     path("auth/register/", RegisterView.as_view()),
     path("auth/login/", LoginView.as_view()),
     path("auth/logout/", LogoutView.as_view()),
+    path("auth/verify-otp/", VerifyOtpView.as_view()),
+    path("auth/resend-otp/", ResendOtpView.as_view()),
     path("users/me/", MyProfileView.as_view()),
     path("users/me/settings/", UserSettingsView.as_view()),
+    path("users/me/password/otp/", RequestPasswordOtpView.as_view()),
     path("users/me/password/", ChangePasswordView.as_view()),
     path("users/me/email/", ChangeEmailView.as_view()),
     path("users/me/deactivate/", DeactivateAccountView.as_view()),
@@ -62,6 +71,9 @@ urlpatterns = [
     path("families/<str:family_id>/relationship/", FamilyRelationshipLookupView.as_view()),
     path("families/<str:family_id>/summary/", FamilySummaryView.as_view()),
     path("families/<str:family_id>/households/", FamilyHouseholdsView.as_view()),
+    path("families/<str:family_id>/moments/", FamilyMomentsView.as_view()),
+    path("families/<str:family_id>/moments/<str:memory_id>/", MemoryDetailView.as_view()),
+    path("memories/media/<str:memory_id>/<str:file_id>/", stream_memory_media),
     path("households/<str:household_id>/", HouseholdDetailView.as_view()),
     path("households/<str:household_id>/members/", HouseholdMembersView.as_view()),
     path("households/<str:household_id>/messages/", HouseholdMessagesView.as_view()),

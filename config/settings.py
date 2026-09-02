@@ -85,6 +85,19 @@ JWT_ACCESS_MINUTES = int(os.getenv("JWT_ACCESS_MINUTES", "60"))
 CORS_ALLOWED_ORIGINS = csv_env("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 CORS_ALLOW_CREDENTIALS = False
 
+# Gmail SMTP for OTP emails. Deliberately not a hard startup requirement (unlike
+# MONGODB_URI): these may be blank in local dev, where @test.com accounts bypass OTP
+# entirely (see apps/core/otp.py) so the app is still fully usable without them configured.
+GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+EMAIL_HOST = "smtp.gmail.com"
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = GMAIL_EMAIL
+EMAIL_HOST_PASSWORD = GMAIL_APP_PASSWORD
+DEFAULT_FROM_EMAIL = f"Root & Kin (Do Not Reply) <{GMAIL_EMAIL or 'no-reply@rootandkin.local'}>"
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": ["apps.core.authentication.MongoJWTAuthentication"],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
