@@ -1,4 +1,5 @@
 """Environment-backed settings for the Family Tree API."""
+from importlib.util import find_spec
 from pathlib import Path
 import os
 
@@ -20,7 +21,15 @@ if not SECRET_KEY:
 DEBUG = os.getenv("DEBUG", "False").lower() in {"1", "true", "yes"}
 ALLOWED_HOSTS = csv_env("ALLOWED_HOSTS", "localhost,127.0.0.1")
 
+# Django Channels is an optional extra. With it installed the Play section's game rooms
+# get websockets; without it the very same API still works over polling, so the app runs
+# unchanged on a plain WSGI deployment. daphne must precede staticfiles to take over
+# runserver, which is why this is prepended rather than appended.
+CHANNELS_ENABLED = find_spec("channels") is not None
+REALTIME_APPS = [name for name in ("daphne", "channels") if find_spec(name) is not None] if CHANNELS_ENABLED else []
+
 INSTALLED_APPS = [
+    *REALTIME_APPS,
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
@@ -30,7 +39,17 @@ INSTALLED_APPS = [
     "rest_framework",
     "apps.core",
     "apps.api",
+    "apps.games",
 ]
+
+if CHANNELS_ENABLED:
+    # In-memory is correct for a single process (local dev, a single container). Point
+    # REDIS_URL at a Redis instance to run more than one worker.
+    REDIS_URL = os.getenv("REDIS_URL", "")
+    if REDIS_URL and find_spec("channels_redis") is not None:
+        CHANNEL_LAYERS = {"default": {"BACKEND": "channels_redis.core.RedisChannelLayer", "CONFIG": {"hosts": [REDIS_URL]}}}
+    else:
+        CHANNEL_LAYERS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",

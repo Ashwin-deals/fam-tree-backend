@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import include, path
 
 from .media_views import stream_memory_media
 from .views import (
@@ -44,6 +44,8 @@ from .views import (
 )
 
 urlpatterns = [
+    # The Play section keeps its own URL module so games stay isolated from the rest.
+    path("games/", include("apps.games.urls")),
     path("auth/register/", RegisterView.as_view()),
     path("auth/login/", LoginView.as_view()),
     path("auth/logout/", LogoutView.as_view()),

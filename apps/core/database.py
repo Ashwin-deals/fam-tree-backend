@@ -66,5 +66,18 @@ def get_database() -> Database:
                 database.memories.create_index([("household_id", ASCENDING)], sparse=True, name="memory_household")
                 database.memories.create_index([("selected_user_ids", ASCENDING)], sparse=True, name="memory_selected_viewers")
                 database.memories.create_index([("tagged_user_ids", ASCENDING)], sparse=True, name="memory_tagged_members")
+                # Play: game rooms, live state, invitations and finished-game history.
+                database.game_rooms.create_index([("code", ASCENDING)], name="game_room_code")
+                database.game_rooms.create_index([("status", ASCENDING), ("last_activity_at", DESCENDING)], name="game_room_open")
+                database.game_rooms.create_index([("players.user_id", ASCENDING), ("status", ASCENDING)], name="game_room_participant")
+                database.game_rooms.create_index([("family_id", ASCENDING), ("status", ASCENDING)], sparse=True, name="game_room_family")
+                database.game_rooms.create_index([("game_id", ASCENDING), ("status", ASCENDING)], name="game_room_by_game")
+                database.game_states.create_index([("room_id", ASCENDING)], unique=True, name="unique_game_state_room")
+                database.game_invitations.create_index([("room_id", ASCENDING), ("to_user_id", ASCENDING)], unique=True, name="unique_game_invitation")
+                database.game_invitations.create_index([("to_user_id", ASCENDING), ("status", ASCENDING)], name="game_invitation_inbox")
+                # TTL: an unanswered invitation removes itself a day after it expires.
+                database.game_invitations.create_index([("expires_at", ASCENDING)], expireAfterSeconds=0, name="game_invitation_ttl")
+                database.game_results.create_index([("participant_ids", ASCENDING), ("finished_at", DESCENDING)], name="game_history_for_user")
+                database.game_results.create_index([("room_id", ASCENDING)], unique=True, name="unique_game_result_room")
                 _indexes_created = True
     return database

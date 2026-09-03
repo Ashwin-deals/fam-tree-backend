@@ -7,3 +7,7 @@ certifi>=2024.8.30
 python-dotenv>=1.0,<2.0
 django-cors-headers>=4.4,<5.0
 Pillow>=10.4,<12.0
+# Optional realtime extra: enables websockets for the Play section's game rooms.
+# Without these installed the same API still works over polling (see apps/games/realtime.py).
+channels>=4.1,<5.0
+daphne>=4.1,<5.0
